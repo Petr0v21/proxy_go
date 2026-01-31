@@ -24,10 +24,12 @@ var (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
+	// Expose tunnel server (agent connects here)
 	go runTunnelServer(":9000")
 
-	go runHTTPProxy("127.0.0.1:8080")
-	go runSOCKS5("127.0.0.1:1080")
+	// Expose proxies publicly (make sure you firewall this in real VPS)
+	go runHTTPProxy(":8080")
+	go runSOCKS5(":1080")
 
 	select {}
 }
@@ -45,10 +47,12 @@ func runTunnelServer(addr string) {
 			log.Printf("tunnel accept error: %v", err)
 			continue
 		}
+
 		// Replace active agent connection (lab: only one)
 		if v := activeMux.Load(); v != nil {
 			_ = v.(*tunnel.ServerMux).Close()
 		}
+
 		m := tunnel.NewServerMux(c)
 		activeMux.Store(m)
 		log.Printf("Agent connected from %s", c.RemoteAddr())
@@ -67,7 +71,7 @@ func getMux() (*tunnel.ServerMux, error) {
 	return m, nil
 }
 
-// -------------------- HTTP CONNECT proxy --------------------
+// -------------------- HTTP proxy (CONNECT + plain HTTP) --------------------
 
 func runHTTPProxy(addr string) {
 	srv := &http.Server{
@@ -75,23 +79,29 @@ func runHTTPProxy(addr string) {
 		ReadHeaderTimeout: 10 * time.Second,
 		Handler:           http.HandlerFunc(httpHandler),
 	}
-	log.Printf("HTTP CONNECT proxy on %s", addr)
+	log.Printf("HTTP proxy on %s", addr)
 	log.Fatal(srv.ListenAndServe())
 }
 
 func httpHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodConnect {
-		http.Error(w, "Only CONNECT is supported in this lab proxy", http.StatusMethodNotAllowed)
-		return
-	}
-
 	mux, err := getMux()
 	if err != nil {
 		http.Error(w, "No agent connected", http.StatusServiceUnavailable)
 		return
 	}
 
+	if r.Method == http.MethodConnect {
+		handleHTTPConnect(w, r, mux)
+		return
+	}
+
+	// Plain HTTP proxy request (absolute-form) or origin-form.
+	handleHTTPForward(w, r, mux)
+}
+
+func handleHTTPConnect(w http.ResponseWriter, r *http.Request, mux *tunnel.ServerMux) {
 	target := r.Host // host:port
+
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
@@ -120,6 +130,99 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	go func() { _, e := io.Copy(up, clientConn); errCh <- e }()
 	go func() { _, e := io.Copy(clientConn, up); errCh <- e }()
 	<-errCh
+}
+
+func handleHTTPForward(w http.ResponseWriter, r *http.Request, mux *tunnel.ServerMux) {
+	// For plain HTTP proxying we can use Transport with a custom DialContext.
+	// Important: we must convert request into a client request:
+	// - RequestURI must be empty
+	// - URL must contain Scheme/Host (absolute) or we derive it from Host header
+	// - hop-by-hop headers must be removed
+	ctx := r.Context()
+
+	req := r.Clone(ctx)
+	req.RequestURI = ""
+
+	// Determine destination.
+	// If client uses proxy absolute-form, Go parses it into URL with Scheme/Host.
+	// If client uses origin-form ("/path"), URL.Host may be empty; use Host header.
+	if req.URL.Scheme == "" {
+		req.URL.Scheme = "http"
+	}
+	if req.URL.Host == "" {
+		req.URL.Host = req.Host
+	}
+	req.Host = req.URL.Host
+
+	removeHopByHopHeaders(req.Header)
+
+	tr := &http.Transport{
+		Proxy: nil,
+		// Network will be "tcp" (for http) most of the time.
+		DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+			// addr is "host:port". If port is missing, add default.
+			host, port, splitErr := net.SplitHostPort(addr)
+			if splitErr != nil {
+				// Might be missing port; assume 80
+				host = addr
+				port = "80"
+			}
+			target := net.JoinHostPort(host, port)
+			return mux.Dial(dctx, target)
+		},
+		DisableCompression:  false,
+		DisableKeepAlives:   false,
+		ForceAttemptHTTP2:   false, // keep it simple for the lab
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		http.Error(w, "Upstream request failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	removeHopByHopHeaders(resp.Header)
+	copyHeader(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+var hopByHopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"TE",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func removeHopByHopHeaders(h http.Header) {
+	// Remove headers listed in "Connection" header too.
+	if c := h.Get("Connection"); c != "" {
+		for _, f := range strings.Split(c, ",") {
+			if f = strings.TrimSpace(f); f != "" {
+				h.Del(f)
+			}
+		}
+	}
+	for _, k := range hopByHopHeaders {
+		h.Del(k)
+	}
+}
+
+func copyHeader(dst, src http.Header) {
+	for k, vv := range src {
+		// Replace to be safe; typical proxy behavior.
+		dst.Del(k)
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
 }
 
 // -------------------- SOCKS5 proxy (no auth, CONNECT only) --------------------
@@ -160,6 +263,7 @@ func handleSocksConn(c net.Conn) {
 	if _, err := io.ReadFull(br, methods); err != nil {
 		return
 	}
+
 	// Choose no-auth if offered
 	chosen := byte(0xFF)
 	for _, m := range methods {
@@ -263,7 +367,6 @@ func socksReadAddr(r *bufio.Reader, atyp byte) (host string, port string, err er
 	p := binary.BigEndian.Uint16(pb)
 	port = fmt.Sprintf("%d", p)
 
-	// Trim IPv6 zone if any (safety)
 	host = strings.TrimSpace(host)
 	return
 }

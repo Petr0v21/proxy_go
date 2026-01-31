@@ -86,13 +86,13 @@ type Dialer interface {
 }
 
 type ServerMux struct {
-	conn     net.Conn
-	br       *bufio.Reader
-	bw       *bufio.Writer
-	writeMu  sync.Mutex
-	streams  sync.Map // map[uint32]*srvStream
-	nextID   uint32
-	alive    atomic.Bool
+	conn      net.Conn
+	br        *bufio.Reader
+	bw        *bufio.Writer
+	writeMu   sync.Mutex
+	streams   sync.Map // map[uint32]*srvStream
+	nextID    uint32
+	alive     atomic.Bool
 	closeOnce sync.Once
 
 	pingInterval time.Duration
@@ -121,7 +121,7 @@ func (m *ServerMux) Close() error {
 		// Close all streams
 		m.streams.Range(func(k, v any) bool {
 			s := v.(*srvStream)
-			s.closeLocal()
+			s.closeLocal(errors.New("mux closed"))
 			return true
 		})
 	})
@@ -140,7 +140,7 @@ func (m *ServerMux) Dial(ctx context.Context, addr string) (net.Conn, error) {
 	// Send OPEN
 	if err := m.send(frame{t: FOpen, id: id, pld: []byte(addr)}); err != nil {
 		m.streams.Delete(id)
-		s.closeLocal()
+		s.closeLocal(err)
 		return nil, err
 	}
 
@@ -149,14 +149,14 @@ func (m *ServerMux) Dial(ctx context.Context, addr string) (net.Conn, error) {
 	case err := <-s.openCh:
 		if err != nil {
 			m.streams.Delete(id)
-			s.closeLocal()
+			s.closeLocal(err)
 			return nil, err
 		}
 		return s, nil
 	case <-ctx.Done():
 		_ = m.send(frame{t: FClose, id: id})
 		m.streams.Delete(id)
-		s.closeLocal()
+		s.closeLocal(ctx.Err())
 		return nil, ctx.Err()
 	}
 }
@@ -200,7 +200,7 @@ func (m *ServerMux) readLoop() {
 				m.streams.Delete(f.id)
 			}
 		default:
-			// Unknown frame type: close
+			// Unknown frame type: close mux
 			return
 		}
 	}
@@ -219,15 +219,21 @@ func (m *ServerMux) pingLoop() {
 }
 
 // -------------------- Server stream net.Conn --------------------
+//
+// Important design point:
+// Never block m.readLoop() on slow stream consumers.
+// We buffer incoming FData per-stream and drain it in a dedicated goroutine.
+//
 
 type srvStream struct {
-	mux   *ServerMux
-	id    uint32
-	addr  string
+	mux  *ServerMux
+	id   uint32
+	addr string
 
 	pr *io.PipeReader
 	pw *io.PipeWriter
 
+	inCh   chan []byte
 	openCh chan error
 
 	closed atomic.Bool
@@ -236,14 +242,31 @@ type srvStream struct {
 
 func newSrvStream(mux *ServerMux, id uint32, addr string) *srvStream {
 	pr, pw := io.Pipe()
-	return &srvStream{
+	s := &srvStream{
 		mux:    mux,
 		id:     id,
 		addr:   addr,
 		pr:     pr,
 		pw:     pw,
+		inCh:   make(chan []byte, 128),
 		openCh: make(chan error, 1),
 	}
+	go s.drainLoop()
+	return s
+}
+
+func (s *srvStream) drainLoop() {
+	for p := range s.inCh {
+		if len(p) == 0 {
+			continue
+		}
+		_, err := s.pw.Write(p)
+		if err != nil {
+			break
+		}
+	}
+	// Ensure local side is closed
+	s.closeLocal(errors.New("stream drain stopped"))
 }
 
 func (s *srvStream) onFrame(f frame) {
@@ -262,17 +285,34 @@ func (s *srvStream) onFrame(f frame) {
 		case s.openCh <- errors.New(msg):
 		default:
 		}
+		s.closeLocal(errors.New(msg))
 	case FData:
-		// Write incoming data into pipe
-		_, _ = s.pw.Write(f.pld)
+		// Non-blocking enqueue; if buffer is full, close the stream.
+		select {
+		case s.inCh <- f.pld:
+		default:
+			// Best effort to notify peer; keep lab-simple.
+			_ = s.mux.send(frame{t: FClose, id: s.id})
+			s.mux.streams.Delete(s.id)
+			s.closeLocal(errors.New("server stream buffer full"))
+		}
 	case FClose:
-		s.closeLocal()
+		s.closeLocal(errors.New("remote closed"))
 	}
 }
 
-func (s *srvStream) closeLocal() {
+func (s *srvStream) closeLocal(reason error) {
 	s.once.Do(func() {
 		s.closed.Store(true)
+
+		// Unblock Dial() if still waiting for OPEN_OK/FAIL.
+		select {
+		case s.openCh <- reason:
+		default:
+		}
+
+		// Stop drain loop and close pipes
+		close(s.inCh)
 		_ = s.pw.Close()
 		_ = s.pr.Close()
 	})
@@ -280,12 +320,13 @@ func (s *srvStream) closeLocal() {
 
 // net.Conn interface
 
-func (s *srvStream) Read(p []byte) (int, error)  { return s.pr.Read(p) }
+func (s *srvStream) Read(p []byte) (int, error) { return s.pr.Read(p) }
+
 func (s *srvStream) Write(p []byte) (int, error) {
 	if s.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
-	// Send as DATA frames (chunk if needed)
+
 	written := 0
 	for len(p) > 0 {
 		chunk := p
@@ -300,15 +341,17 @@ func (s *srvStream) Write(p []byte) (int, error) {
 	}
 	return written, nil
 }
+
 func (s *srvStream) Close() error {
 	if s.closed.Load() {
 		return nil
 	}
 	_ = s.mux.send(frame{t: FClose, id: s.id})
 	s.mux.streams.Delete(s.id)
-	s.closeLocal()
+	s.closeLocal(errors.New("local close"))
 	return nil
 }
+
 func (s *srvStream) LocalAddr() net.Addr                { return dummyAddr("server-stream") }
 func (s *srvStream) RemoteAddr() net.Addr               { return dummyAddr(s.addr) }
 func (s *srvStream) SetDeadline(t time.Time) error      { return nil }
@@ -323,12 +366,12 @@ func (d dummyAddr) String() string  { return string(d) }
 // -------------------- Client side (phone agent) --------------------
 
 type AgentMux struct {
-	conn     net.Conn
-	br       *bufio.Reader
-	bw       *bufio.Writer
-	writeMu  sync.Mutex
-	streams  sync.Map // map[uint32]*agentStream
-	alive    atomic.Bool
+	conn      net.Conn
+	br        *bufio.Reader
+	bw        *bufio.Writer
+	writeMu   sync.Mutex
+	streams   sync.Map // map[uint32]*agentStream
+	alive     atomic.Bool
 	closeOnce sync.Once
 }
 
@@ -425,7 +468,6 @@ func newAgentStream(m *AgentMux, id uint32, addr string) *agentStream {
 }
 
 func (s *agentStream) openAndRun() {
-	// Dial outbound to internet
 	up, err := net.DialTimeout("tcp", s.addr, 10*time.Second)
 	if err != nil {
 		_ = s.mux.send(frame{t: FOpenFail, id: s.id, pld: []byte(err.Error())})
@@ -479,7 +521,6 @@ func (s *agentStream) openAndRun() {
 func (s *agentStream) onFrame(f frame) {
 	switch f.t {
 	case FData:
-		// Backpressure: if channel is full, we drop and close
 		select {
 		case s.inCh <- f.pld:
 		default:
