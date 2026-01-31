@@ -24,12 +24,9 @@ var (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	// Expose tunnel server (agent connects here)
-	go runTunnelServer(":9000")
-
-	// Expose proxies publicly (make sure you firewall this in real VPS)
-	go runHTTPProxy(":8080")
-	go runSOCKS5(":1080")
+	go runTunnelServer("0.0.0.0:9000")
+	go runHTTPProxy("0.0.0.0:8080")
+	go runSOCKS5("0.0.0.0:1080")
 
 	select {}
 }
