@@ -24,9 +24,9 @@ var (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	go runTunnelServer("0.0.0.0:9000")
-	go runHTTPProxy("0.0.0.0:8080")
-	go runSOCKS5("0.0.0.0:1080")
+	go runTunnelServer("0.0.0.0:29000")
+	go runHTTPProxy("0.0.0.0:28080")
+	go runSOCKS5("0.0.0.0:21080")
 
 	select {}
 }
